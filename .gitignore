@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual env
+.venv/
+venv/
+ENV/
+env/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Local outputs / generated files
+output/
+outputs/
+*.log
+
+# Optional: if you don’t want to commit any generated Excel outputs
+*.xlsx
+
+# BUT keep your sample/template Excel files if you have them in sample_data/
+!sample_data/*.xlsx
