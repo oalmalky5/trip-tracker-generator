@@ -1,7 +1,7 @@
 # Trip Tracker Generator (Streamlit)
 
 A push-button tool that generates a trip coordination tracker from CRM exports (Accounts + Contacts).
-Built to be **repeatable, automated, and maintainable**, with a clear seam to later swap the data source to **HubSpot**.
+Built to be repeatable, automated, and maintainable
 
 ## Why this exists
 
