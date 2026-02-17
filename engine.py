@@ -1,9 +1,10 @@
-from __future__ import annotations
+# engine.py
+# Core generation + Excel export logic for Trip Tracker Generator (Streamlit)
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional, Tuple, Dict, List
+from typing import Dict, List, Optional, Tuple
 import random
 import re
 
@@ -11,33 +12,6 @@ import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
-
-
-def suggest_fix(issue: str, field: str = "", context: str = "") -> str:
-    t = (issue or "").lower()
-    f = (field or "").lower()
-    c = (context or "").lower()
-
-    if "email" in t or "email" in f:
-        return "Add a valid email address for the primary contact in CRM (Contacts export)."
-    if "address" in t or "address" in f or "location" in t:
-        return "Add the meeting address or HQ address in CRM (Accounts export)."
-    if "owner" in t or "owner" in f:
-        return "Assign an account owner in CRM so meetings can be distributed."
-    if "description" in t or "description" in f:
-        return "Add a short company description in CRM (optional)."
-    if "duplicate" in t:
-        return "De-duplicate the record in CRM or confirm which record should be used."
-    if "missing" in t or "blank" in t or "empty" in t:
-        return "Fill the missing value in CRM and re-export."
-
-    # Context-aware fallbacks
-    if c == "account":
-        return "Review the Accounts export and correct the value in CRM, then re-export."
-    if c == "contact":
-        return "Review the Contacts export and correct the value in CRM, then re-export."
-
-    return "Review the CRM export and correct the value."
 
 
 TEMPLATE_HEADERS = [
@@ -54,6 +28,36 @@ TEMPLATE_HEADERS = [
 ]
 
 STATUS_OPTIONS = ["Proposed", "Tentative", "Confirmed", "Rescheduled", "Cancelled", "Done"]
+
+
+def suggest_fix(issue: str, field: str = "", context: str = "") -> str:
+    """
+    Heuristic suggestions used in the Data Issues tab.
+    issue: human-readable message
+    field: the field name (if available)
+    context: optional extra context (not required)
+    """
+    t = (issue or "").lower()
+    f = (field or "").lower()
+    c = (context or "").lower()
+
+    blob = " ".join([t, f, c])
+
+    if "email" in blob:
+        return "Add a valid email address for the primary contact in CRM (Contacts export)."
+    if "address" in blob or "location" in blob or "hq" in blob:
+        return "Add the meeting address / HQ address in CRM (Accounts export)."
+    if "owner" in blob:
+        return "Assign an account owner in CRM so meetings can be distributed."
+    if "description" in blob:
+        return "Add a short company description in CRM (optional)."
+    if "duplicate" in blob:
+        return "De-duplicate the record in CRM or confirm which record should be used."
+    if "missing" in blob or "blank" in blob:
+        return "Fill the missing value in CRM and re-export."
+    if "no matching contacts" in blob:
+        return "Ensure contacts are associated with the correct company (website/company name match) and re-export."
+    return "Review the CRM export and correct the value."
 
 
 @dataclass(frozen=True)
@@ -86,25 +90,36 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
 
 
-def load_accounts_contacts(accounts_path: Path, contacts_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_accounts_contacts(accounts_path: Path, contacts_path: Optional[Path]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Loads the case-study exports (Excel).
+    contacts_path can be None (app supports accounts-only flow).
+    """
     accounts = pd.read_excel(accounts_path)
-    contacts = pd.read_excel(contacts_path)
+
+    if contacts_path is None:
+        contacts = pd.DataFrame()
+    else:
+        contacts = pd.read_excel(contacts_path)
+
     return accounts, contacts
 
 
 def pick_accounts(accounts: pd.DataFrame, n: int, seed: int, city: Optional[str] = None) -> pd.DataFrame:
+    """
+    Picks N accounts.
+    If city is provided and 'HQ City' exists, we prefer accounts with that city (when possible).
+    """
     rnd = random.Random(seed)
     df = accounts.copy()
 
-    if city:
-        hq_city = df.get("HQ City")
-        if hq_city is not None:
-            df_city = df[df["HQ City"].fillna("").astype(str).str.lower().str.contains(city.lower())]
-            if len(df_city) >= n:
-                df = df_city
+    if city and "HQ City" in df.columns:
+        df_city = df[df["HQ City"].fillna("").astype(str).str.lower().str.contains(city.lower())]
+        if len(df_city) >= n:
+            df = df_city
 
     if len(df) <= n:
-        return df.sample(n=min(n, len(df)), random_state=seed)
+        return df.sample(n=min(n, len(df)), random_state=seed).reset_index(drop=True)
 
     idx = rnd.sample(list(df.index), k=n)
     return df.loc[idx].reset_index(drop=True)
@@ -114,15 +129,18 @@ def select_primary_contact_for_account(
     account_row: pd.Series,
     contacts: pd.DataFrame,
     issues: List[Issue],
-) -> tuple[str, str]:
+) -> Tuple[str, str]:
     """
-    Return (name, email). Uses account primary contact if present, else picks from contacts export.
+    Return (name, email).
 
-    Matching strategy:
-    1) Use account's Primary Contact Email if present
-    2) Match contacts by Primary Company Website == account Website (case-insensitive)
-    3) Match contacts by Primary Company == account Companies (case-insensitive)
-    Choose first contact with email; prefer exact name match to account Primary Contact if present.
+    Strategy:
+    1) Use account's 'Primary Contact Email' if present
+    2) Else, if contacts provided:
+        a) Match by Primary Company Website == account Website
+        b) Else match by Primary Company == account Companies
+       Choose first contact with an email. If account Primary Contact name exists, prefer exact match.
+
+    If no contacts provided or no match found, return ("","") and emit WARNING.
     """
     company_id = _safe_str(account_row.get("Company ID", ""))
     acct_primary_name = _safe_str(account_row.get("Primary Contact", ""))
@@ -133,13 +151,38 @@ def select_primary_contact_for_account(
     if acct_primary_email:
         return (acct_primary_name or "", acct_primary_email)
 
-    # Build candidate set
+    if contacts is None or contacts.empty:
+        issues.append(Issue(
+            severity="WARNING",
+            entity="account",
+            entity_id=company_id or acct_company or "(unknown)",
+            field="Primary Contact Email",
+            message="Contacts export not provided; primary contact left blank."
+        ))
+        return ("", "")
+
+    # Guard columns existence
+    has_site = "Primary Company Website" in contacts.columns
+    has_company = "Primary Company" in contacts.columns
+    has_email = "Email" in contacts.columns
+    has_people = "People" in contacts.columns
+
+    if not has_email or not has_people or (not has_site and not has_company):
+        issues.append(Issue(
+            severity="WARNING",
+            entity="account",
+            entity_id=company_id or acct_company or "(unknown)",
+            field="Primary Contact Email",
+            message="Contacts export missing expected columns; primary contact left blank."
+        ))
+        return ("", "")
+
     cands = contacts.copy()
 
-    if acct_website and "Primary Company Website" in cands.columns:
+    if acct_website and has_site:
         cands = cands[cands["Primary Company Website"].fillna("").astype(str).str.lower() == acct_website.lower()]
 
-    if cands.empty and acct_company and "Primary Company" in contacts.columns:
+    if cands.empty and acct_company and has_company:
         cands = contacts[contacts["Primary Company"].fillna("").astype(str).str.lower() == acct_company.lower()]
 
     if cands.empty:
@@ -154,12 +197,8 @@ def select_primary_contact_for_account(
 
     # Prefer contacts with email
     cands = cands.copy()
-    if "Email" in cands.columns:
-        cands["_email"] = cands["Email"].apply(_safe_str)
-        cands = cands[cands["_email"].astype(bool)]
-    else:
-        cands = cands.iloc[0:0]
-
+    cands["_email"] = cands["Email"].apply(_safe_str)
+    cands = cands[cands["_email"].astype(bool)]
     if cands.empty:
         issues.append(Issue(
             severity="WARNING",
@@ -170,7 +209,8 @@ def select_primary_contact_for_account(
         ))
         return ("", "")
 
-    if acct_primary_name and "People" in cands.columns:
+    # Prefer exact name match if account has a primary contact name
+    if acct_primary_name:
         norm_target = _norm(acct_primary_name)
         cands["_name"] = cands["People"].apply(_safe_str)
         exact = cands[cands["_name"].apply(_norm) == norm_target]
@@ -182,8 +222,11 @@ def select_primary_contact_for_account(
     return (_safe_str(row.get("People", "")), _safe_str(row.get("Email", "")))
 
 
-def generate_schedule(cfg: TripConfig, n: int) -> list[tuple[date, str]]:
-    """Returns list of (meeting_date, meeting_time). Distributes across days, avoids same-day time conflicts."""
+def generate_schedule(cfg: TripConfig, n: int) -> List[Tuple[date, str]]:
+    """
+    Returns list of (meeting_date, meeting_time).
+    Distributes meetings across days; times are within business hours (09:00-17:30), 30-min increments.
+    """
     rnd = random.Random(cfg.seed)
 
     days = (cfg.end_date - cfg.start_date).days + 1
@@ -194,14 +237,15 @@ def generate_schedule(cfg: TripConfig, n: int) -> list[tuple[date, str]]:
     for i in range(n):
         per_day[i % days] += 1
 
-    slots: list[tuple[date, str]] = []
+    slots: List[Tuple[date, str]] = []
     for d, count in enumerate(per_day):
         day = cfg.start_date + timedelta(days=d)
-        possible = [f"{h:02d}:{m:02d}" for h in range(9, 18) for m in (0, 30)]
+        possible = [f"{h:02d}:{m:02d}" for h in range(9, 18) for m in (0, 30)]  # 09:00 -> 17:30
         rnd.shuffle(possible)
         chosen = sorted(possible[:count])
         for t in chosen:
             slots.append((day, t))
+
     return slots
 
 
@@ -209,13 +253,13 @@ def build_meetings_df(
     accounts: pd.DataFrame,
     contacts: pd.DataFrame,
     cfg: TripConfig,
-) -> tuple[pd.DataFrame, list[Issue], dict]:
-    issues: list[Issue] = []
+) -> Tuple[pd.DataFrame, List[Issue], Dict]:
+    issues: List[Issue] = []
 
     picked = pick_accounts(accounts, cfg.meetings, cfg.seed, city=cfg.city)
     schedule = generate_schedule(cfg, len(picked))
 
-    rows: list[dict] = []
+    rows: List[Dict] = []
     owners = list(cfg.owners) if cfg.owners else ["Owner"]
     rnd = random.Random(cfg.seed)
 
@@ -224,12 +268,15 @@ def build_meetings_df(
         owner = owners[i % len(owners)]
         status = rnd.choice(STATUS_OPTIONS)
 
+        acct_id = _safe_str(acct.get("Company ID", "(unknown)"))
         acct_name = _safe_str(acct.get("Companies", ""))
         desc = _safe_str(acct.get("Description", ""))
+
         addr1 = _safe_str(acct.get("HQ Address Line 1", ""))
         addr2 = _safe_str(acct.get("HQ Address Line 2", ""))
-        city = _safe_str(acct.get("HQ City", "")) or cfg.city
-        address = ", ".join([p for p in [addr1, addr2, city] if p])
+        hq_city = _safe_str(acct.get("HQ City", ""))
+        city_val = hq_city or cfg.city
+        address = ", ".join([p for p in [addr1, addr2, city_val] if p])
 
         contact_name, contact_email = select_primary_contact_for_account(acct, contacts, issues)
 
@@ -237,7 +284,7 @@ def build_meetings_df(
             issues.append(Issue(
                 severity="BLOCKER",
                 entity="account",
-                entity_id=_safe_str(acct.get("Company ID", "(unknown)")),
+                entity_id=acct_id,
                 field="Companies",
                 message="Missing account name."
             ))
@@ -246,7 +293,7 @@ def build_meetings_df(
             issues.append(Issue(
                 severity="WARNING",
                 entity="account",
-                entity_id=_safe_str(acct.get("Company ID", "(unknown)")),
+                entity_id=acct_id,
                 field="HQ Address",
                 message="Missing HQ address; meeting address left blank."
             ))
@@ -255,7 +302,7 @@ def build_meetings_df(
             issues.append(Issue(
                 severity="WARNING",
                 entity="contact",
-                entity_id=_safe_str(acct.get("Company ID", "(unknown)")),
+                entity_id=acct_id,
                 field="Email",
                 message="Primary contact email missing."
             ))
@@ -275,22 +322,19 @@ def build_meetings_df(
 
     meetings_df = pd.DataFrame(rows, columns=TEMPLATE_HEADERS)
 
-    industries = picked.get("Primary Industry Group")
-    ind_counts = (
-        industries.fillna("(blank)").astype(str).value_counts().to_dict()
-        if industries is not None
-        else {}
-    )
+    industries = picked["Primary Industry Group"] if "Primary Industry Group" in picked.columns else None
+    ind_counts = industries.fillna("(blank)").astype(str).value_counts().to_dict() if industries is not None else {}
 
     stats = {
         "accounts_loaded": int(len(accounts)),
-        "contacts_loaded": int(len(contacts)),
+        "contacts_loaded": int(len(contacts)) if contacts is not None else 0,
         "meetings": int(len(meetings_df)),
         "days": int((cfg.end_date - cfg.start_date).days + 1),
         "owner_counts": meetings_df["East40 Meeting Owner"].value_counts().to_dict() if not meetings_df.empty else {},
         "status_counts": meetings_df["Meeting Status"].value_counts().to_dict() if not meetings_df.empty else {},
         "industry_counts": ind_counts,
     }
+
     return meetings_df, issues, stats
 
 
@@ -311,13 +355,22 @@ def export_excel(
     cfg: TripConfig,
     meetings_df: pd.DataFrame,
     contacts_df: pd.DataFrame,
-    issues: list[Issue],
-    stats: dict,
-    run_log_lines: list[str],
+    issues: List[Issue],
+    stats: Dict,
+    run_log_lines: List[str],
 ) -> Path:
+    """
+    Writes the generated tracker based on the provided template.
+    Produces:
+      - Trip Overview
+      - Meetings
+      - Contacts Directory
+      - Summary
+      - Data Issues (with Suggested Fix)
+    """
     wb = load_workbook(template_path)
 
-    # Rename first sheet to Meetings (matches provided template structure)
+    # Rename main sheet to Meetings (assume first sheet is the template sheet)
     main = wb[wb.sheetnames[0]]
     main.title = "Meetings"
 
@@ -325,7 +378,7 @@ def export_excel(
     if main.max_row > 1:
         main.delete_rows(2, main.max_row - 1)
 
-    # Write meetings
+    # Write meetings rows
     for r_idx, row in enumerate(meetings_df.itertuples(index=False), start=2):
         for c_idx, value in enumerate(row, start=1):
             main.cell(row=r_idx, column=c_idx, value=value)
@@ -337,7 +390,6 @@ def export_excel(
     if "Trip Overview" in wb.sheetnames:
         del wb["Trip Overview"]
     ov = wb.create_sheet("Trip Overview", 0)
-
     ov["A1"] = "Trip"
     ov["B1"] = cfg.trip_name
     ov["A2"] = "Dates"
@@ -368,7 +420,7 @@ def export_excel(
         sm[f"A{r}"].font = Font(bold=True)
         sm[f"B{r}"].font = Font(bold=True)
         r += 1
-        for k, v in counts.items():
+        for k, v in (counts or {}).items():
             sm[f"A{r}"] = k
             sm[f"B{r}"] = int(v)
             r += 1
@@ -379,42 +431,35 @@ def export_excel(
     r = _write_counts(r, "Meetings by Owner", stats.get("owner_counts", {}))
     r = _write_counts(r, "Accounts by Industry Group", stats.get("industry_counts", {}))
 
-    # Contacts Directory
+    # Contacts Directory (for selected accounts)
     if "Contacts Directory" in wb.sheetnames:
         del wb["Contacts Directory"]
     cd = wb.create_sheet("Contacts Directory")
 
-    contact_cols = [
-        c for c in [
-            "People",
-            "Email",
-            "Phone",
-            "Primary Position",
-            "Primary Company",
-            "Primary Company Type",
-            "City",
-            "Country/Territory/Region",
-            "LinkedIn URL",
+    if contacts_df is None or contacts_df.empty:
+        cd["A1"] = "No contacts provided or no matching contacts found."
+    else:
+        contact_cols = [
+            c for c in [
+                "People", "Email", "Phone", "Primary Position", "Primary Company",
+                "Primary Company Type", "City", "Country/Territory/Region", "LinkedIn URL"
+            ]
+            if c in contacts_df.columns
         ]
-        if c in contacts_df.columns
-    ]
-
-    for c_idx, col in enumerate(contact_cols, start=1):
-        cd.cell(row=1, column=c_idx, value=col).font = Font(bold=True)
-
-    if contact_cols:
+        for c_idx, col in enumerate(contact_cols, start=1):
+            cd.cell(row=1, column=c_idx, value=col).font = Font(bold=True)
         for r_idx, row in enumerate(contacts_df[contact_cols].fillna("").itertuples(index=False), start=2):
             for c_idx, v in enumerate(row, start=1):
                 cd.cell(row=r_idx, column=c_idx, value=v)
 
         cd.freeze_panes = "A2"
-        cd.auto_filter.ref = f"A1:{get_column_letter(len(contact_cols))}{cd.max_row}"
+        if contact_cols:
+            cd.auto_filter.ref = f"A1:{get_column_letter(len(contact_cols))}{cd.max_row}"
 
     # Data Issues (with Suggested Fix)
     if "Data Issues" in wb.sheetnames:
         del wb["Data Issues"]
     di = wb.create_sheet("Data Issues")
-
     di_headers = ["Severity", "Entity", "Entity ID", "Field", "Message", "Suggested Fix"]
     for c_idx, h in enumerate(di_headers, start=1):
         di.cell(row=1, column=c_idx, value=h).font = Font(bold=True)
@@ -425,14 +470,12 @@ def export_excel(
         di.cell(row=r_idx, column=3, value=iss.entity_id)
         di.cell(row=r_idx, column=4, value=iss.field)
         di.cell(row=r_idx, column=5, value=iss.message)
-
-        fix = suggest_fix(iss.message, field=iss.field, context=iss.entity)
-        di.cell(row=r_idx, column=6, value=fix)
+        di.cell(row=r_idx, column=6, value=suggest_fix(iss.message, iss.field, iss.entity))
 
     di.freeze_panes = "A2"
     di.auto_filter.ref = f"A1:{get_column_letter(len(di_headers))}{di.max_row}"
 
-    # Auto-fit columns
+    # Fit columns
     for ws in [ov, sm, cd, di, main]:
         _auto_fit_columns(ws)
 
