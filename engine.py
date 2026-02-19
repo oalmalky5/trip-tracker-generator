@@ -13,7 +13,8 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
-
+## here we are locking down the expected headers in the generated meetins sheet in a py list.
+## needs to be consistent with the template to not allow it to drift and create confusiong for the user
 TEMPLATE_HEADERS = [
     "Customer Account Name",
     "Meeting Date",
@@ -27,6 +28,7 @@ TEMPLATE_HEADERS = [
     "Company Description",
 ]
 
+## here we are lokcing donw the possible status options for meetings in the generated tracker. This is used both in generation and in the template as a dropdown:
 STATUS_OPTIONS = ["Proposed", "Tentative", "Confirmed", "Rescheduled", "Cancelled", "Done"]
 
 
